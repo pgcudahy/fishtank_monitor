@@ -1,0 +1,16 @@
+database_url = "postgres://user:password@db.example.com/fishtank"
+pg_tls = true
+flush_secs = 300
+http_port = 8080
+
+[mqtt]
+host = "mqtt.example.com"
+port = 1883
+client_id = "fishtank_monitor"
+topic = "fishtank/sensor/+/state"
+# user = "name"
+# password = "secret"
+
+[gotify]
+url = "https://gotify.example.com"
+token = "app-token"
