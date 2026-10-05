@@ -1,0 +1,9 @@
+services:
+  fishtank_monitor:
+    build: .
+    container_name: fishtank_monitor
+    restart: unless-stopped
+    ports:
+      - "3011:8080"
+    volumes:
+      - ./config.toml:/etc/fishtank/config.toml:ro

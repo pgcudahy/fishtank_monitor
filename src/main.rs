@@ -15,27 +15,35 @@ use serde::Deserialize;
 use tokio_postgres::Client;
 
 struct Row {
-    ts_ms: i64,
+    ts: i64, // Unix seconds
     sensor: String,
     value: f64,
 }
 
-// ESPHome publishes fishtank/sensor/<name>/state with a bare number payload
-fn parse(topic: &str, payload: &[u8]) -> Result<(String, f64), String> {
+#[derive(Deserialize)]
+struct Payload {
+    ts: i64, // Unix seconds, set by the sensor from its NTP clock
+    value: f64,
+}
+
+// ESPHome publishes JSON {"ts": <unix seconds>, "value": <number>} to fishtank/reading/<name>
+fn parse(topic: &str, payload: &[u8]) -> Result<Row, String> {
     let parts: Vec<&str> = topic.split('/').collect();
-    if parts.len() != 4 || parts[1] != "sensor" || parts[3] != "state" || parts[2].is_empty() {
+    if parts.len() != 3 || parts[1] != "reading" || parts[2].is_empty() {
         return Err(format!("unexpected topic '{topic}'"));
     }
-    let text = std::str::from_utf8(payload)
-        .map_err(|e| format!("payload on '{topic}' is not UTF-8: {e}"))?
-        .trim();
-    let value: f64 = text
-        .parse()
-        .map_err(|e| format!("payload '{text}' on '{topic}' is not a number: {e}"))?;
-    if !value.is_finite() {
-        return Err(format!("payload '{text}' on '{topic}' is not finite"));
+    let p: Payload = serde_json::from_slice(payload).map_err(|e| {
+        format!("payload '{}' on '{topic}' is invalid: {e}", String::from_utf8_lossy(payload))
+    })?;
+    if !p.value.is_finite() {
+        return Err(format!("value on '{topic}' is not finite"));
     }
-    Ok((parts[2].to_string(), value))
+    // Reject clocks that were never synced (near 1970) or are far in the future
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+    if p.ts < 1_577_836_800 || p.ts > now + 86_400 {
+        return Err(format!("timestamp {} on '{topic}' is out of range", p.ts));
+    }
+    Ok(Row { ts: p.ts, sensor: parts[2].to_string(), value: p.value })
 }
 
 #[derive(Deserialize)]
@@ -196,13 +204,7 @@ async fn main() {
         tokio::select! {
             ev = eventloop.poll() => match ev {
                 Ok(Event::Incoming(Packet::Publish(p))) => match parse(&p.topic, &p.payload) {
-                    Ok((sensor, value)) => {
-                        let ts_ms = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_millis() as i64;
-                        pending.push(Row { ts_ms, sensor, value });
-                    }
+                    Ok(row) => pending.push(row),
                     Err(e) => eprintln!("skipping message: {e}"),
                 },
                 Ok(Event::Incoming(Packet::ConnAck(_))) => {
@@ -257,14 +259,15 @@ async fn main() {
 async fn flush(db_url: &str, pg_tls: bool, rows: &[Row]) -> Result<usize, Box<dyn std::error::Error>> {
     // Build and transform the DataFrame with polars
     let mut df = df!(
-        "ts_ms" => rows.iter().map(|r| r.ts_ms).collect::<Vec<_>>(),
+        "ts" => rows.iter().map(|r| r.ts).collect::<Vec<_>>(),
         "sensor" => rows.iter().map(|r| r.sensor.as_str()).collect::<Vec<_>>(),
         "value" => rows.iter().map(|r| r.value).collect::<Vec<_>>(),
     )?
     .lazy()
     .filter(col("value").is_finite())
     .select([
-        col("ts_ms")
+        // polars datetimes start at milliseconds, so scale the seconds up
+        (col("ts") * lit(1000_i64))
             .cast(DataType::Datetime(TimeUnit::Milliseconds, None))
             .alias("time"),
         col("sensor"),
@@ -283,21 +286,31 @@ async fn flush(db_url: &str, pg_tls: bool, rows: &[Row]) -> Result<usize, Box<dy
         .finish(&mut df)?;
 
     let pg = connect(db_url, pg_tls).await?;
+    // Stage via a temp table so redelivered MQTT messages (QoS 1) can't create duplicates
     pg.batch_execute(
         "SET TIME ZONE 'UTC';
          CREATE TABLE IF NOT EXISTS office_fishtank_readings (
             time timestamptz NOT NULL,
             sensor text NOT NULL,
-            value double precision NOT NULL)",
+            value double precision NOT NULL);
+         CREATE UNIQUE INDEX IF NOT EXISTS office_fishtank_readings_sensor_time
+            ON office_fishtank_readings (sensor, time);
+         CREATE TEMP TABLE staging (LIKE office_fishtank_readings)",
     )
     .await?;
     let sink = pg
-        .copy_in::<_, Bytes>("COPY office_fishtank_readings (time, sensor, value) FROM STDIN WITH (FORMAT csv)")
+        .copy_in::<_, Bytes>("COPY staging (time, sensor, value) FROM STDIN WITH (FORMAT csv)")
         .await?;
     futures_util::pin_mut!(sink);
     sink.send(Bytes::from(buf)).await?;
     sink.close().await?;
-    Ok(n)
+    let inserted = pg
+        .execute(
+            "INSERT INTO office_fishtank_readings SELECT * FROM staging ON CONFLICT DO NOTHING",
+            &[],
+        )
+        .await?;
+    Ok(inserted as usize)
 }
 
 async fn connect(url: &str, tls: bool) -> Result<Client, Box<dyn std::error::Error>> {

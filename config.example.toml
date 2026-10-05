@@ -7,7 +7,7 @@ http_port = 8080
 host = "mqtt.example.com"
 port = 1883
 client_id = "fishtank_monitor"
-topic = "fishtank/sensor/+/state"
+topic = "fishtank/reading/+"
 # user = "name"
 # password = "secret"
 
