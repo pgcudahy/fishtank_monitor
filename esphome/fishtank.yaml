@@ -1,9 +1,57 @@
-# Board: NodeMCU-32S (NodeMCU)
-# Definition: definitions/boards/nodemcu-32s/manifest.yaml
+# ============================================================
+# Fish tank monitoring
+#
+# Hardware:
+#   ESP32 NodeMCU-32S
+#   DS18B20 temperature sensor
+#   DFRobot TDS sensor
+#   DFRobot pH sensor
+#
+# GPIO:
+#   GPIO04 - DS18B20
+#   GPIO25 - TDS power (S8550 + 2N7000)
+#   GPIO26 - pH power  (S8550 + 2N7000)
+#   GPIO34 - TDS ADC
+#   GPIO35 - pH ADC
+#
+# Schedule:
+#   Temperature: every 15 minutes
+#   TDS + pH:    every 2 hours
+#
+# Analog measurements:
+#   60-second settling time
+#   9 samples, 5 seconds apart
+#   Median filter
+# ============================================================
+
 
 esphome:
   name: fishtank
   friendly_name: fishtank
+
+  on_boot:
+    - priority: -100
+      then:
+        - logger.log: "Requesting initial temperature measurement"
+
+        - component.update: water_temperature
+
+        - delay: 2min
+
+        - wait_until:
+            condition:
+              lambda: |-
+                return id(ntp_synchronized)
+                    && id(sntp_time).now().is_valid()
+                    && id(temperature_ready)
+                    && !isnan(id(water_temperature).state);
+
+        - logger.log:
+            format: "Boot test starting; temperature %.2f C"
+            args:
+              - 'id(water_temperature).state'
+
+        - script.execute: measure_water_quality
 
 esp32:
   variant: esp32
@@ -13,62 +61,454 @@ esp32:
 
 logger:
 
-# If you enable MQTT and you do not use the Api,
-# you must remove the api: configuration or set reboot_timeout: 0s,
-# otherwise the ESP will reboot every 15 minutes because no client connected to the native API.
-#api:
-#  encryption:
-#    key: "g4fClnzjjwkFgILs7F2KSutOG1+CSbIm/sKOH77Nx9k="
-
 ota:
   - platform: esphome
 
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
-  manual_ip:
-    static_ip: 192.168.18.3
-    gateway: 192.168.18.1
-    subnet: 255.255.255.0
+
   ap:
     ssid: fishtank Fallback Hotspot
     password: "v9jHWeLq0ln3"
 
 captive_portal:
 
+# ============================================================
+# Startup state
+# ============================================================
+
+globals:
+  # Time the ADC measurement finished; shared by a sensor's voltage and calculated value
+  - id: reading_ts
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: ntp_synchronized
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: temperature_ready
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+
+# ============================================================
+# Time synchronization and scheduling
+# ============================================================
+
 time:
   - platform: sntp
     id: sntp_time
     timezone: "Africa/Johannesburg"
+
     servers:
       - 0.pool.ntp.org
       - 1.pool.ntp.org
       - 2.pool.ntp.org
+
+    on_time_sync:
+      then:
+        - lambda: |-
+            id(ntp_synchronized) = true;
+            ESP_LOGI("main", "NTP synchronized");
+
+    on_time:
+      # Every two hours, on the hour
+      - seconds: 0
+        minutes: 0
+        hours: /2
+        then:
+          - if:
+              condition:
+                lambda: |-
+                  return id(ntp_synchronized)
+                      && id(sntp_time).now().is_valid()
+                      && id(temperature_ready)
+                      && !isnan(id(water_temperature).state);
+              then:
+                - script.execute: measure_water_quality
+              else:
+                - logger.log:
+                    level: WARN
+                    format: "Skipping measurement: NTP or temperature not ready"
+
+
+# ============================================================
+# MQTT
+# ============================================================
 
 mqtt:
   broker: 192.168.18.18
   username: fishtank
   password: !secret fishtank__mqtt_password
 
+
+# ============================================================
+# OneWire
+# ============================================================
+
 one_wire:
   - platform: gpio
     pin: GPIO04
 
+
+# ============================================================
+# Sensors
+# ============================================================
+
 sensor:
+
+  # ----------------------------------------------------------
+  # Temperature
+  # ----------------------------------------------------------
+
   - platform: dallas_temp
     name: water_temperature
-    update_interval: 60s
-    # Publish value + measurement time (Unix seconds) at QoS 1 so the broker
-    # queues readings while the monitor is down. Skipped until SNTP has synced.
+    id: water_temperature
+    update_interval: 15min
     on_value:
       then:
-        - if:
-            condition:
-              time.has_time:
-            then:
-              - mqtt.publish_json:
-                  topic: fishtank/reading/water_temperature
-                  qos: 1
-                  payload: |-
-                    root["ts"] = id(sntp_time).now().timestamp;
-                    root["value"] = x;
+        - lambda: |-
+            if (!isnan(x)) {
+              if (!id(temperature_ready)) {
+                ESP_LOGI("main", "First temperature recorded: %.2f C", x);
+              }
+
+              id(temperature_ready) = true;
+            }
+        - script.execute:
+            id: publish_reading
+            name: water_temperature
+            value: !lambda 'return x;'
+            ts: !lambda 'return (uint32_t) id(sntp_time).now().timestamp;'
+
+
+  # ----------------------------------------------------------
+  # TDS ADC
+  #
+  # Each ADC update averages 20 hardware samples.
+  #
+  # The median filter collects 9 updates before publishing.
+  # ----------------------------------------------------------
+
+  - platform: adc
+    pin: GPIO34
+    name: "TDS Voltage"
+    id: tds_voltage
+
+    attenuation: 12db
+    samples: 20
+    sampling_mode: avg
+
+    update_interval: never
+
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+
+    filters:
+      - median:
+          window_size: 9
+          send_every: 9
+          send_first_at: 9
+
+
+  # ----------------------------------------------------------
+  # pH ADC
+  # ----------------------------------------------------------
+
+  - platform: adc
+    pin: GPIO35
+    name: "pH Voltage"
+    id: ph_voltage
+
+    attenuation: 12db
+    samples: 20
+    sampling_mode: avg
+
+    update_interval: never
+
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+
+    filters:
+      - median:
+          window_size: 9
+          send_every: 9
+          send_first_at: 9
+
+
+  # ----------------------------------------------------------
+  # TDS calculation
+  #
+  # Calibration:
+  #   Standard: 1413 µS/cm
+  #   Conversion: EC × 0.5
+  #   Calibration factor: 0.8323
+  # ----------------------------------------------------------
+
+  - platform: template
+    name: "TDS"
+    id: tds
+
+    unit_of_measurement: "ppm"
+    accuracy_decimals: 0
+
+    update_interval: never
+
+    lambda: |-
+      float voltage = id(tds_voltage).state;
+      float temperature = id(water_temperature).state;
+
+      if (isnan(voltage) || isnan(temperature)) {
+        return NAN;
+      }
+
+      // Temperature compensation to 25 C
+      float compensation = 1.0 + 0.02 * (temperature - 25.0);
+      float v = voltage / compensation;
+
+      // DFRobot TDS polynomial
+      float tds = (133.42 * v * v * v
+                   - 255.86 * v * v
+                   + 857.39 * v) * 0.5;
+
+      // Calibration factor
+      float calibration = 0.8323;
+
+      return tds * calibration;
+
+
+  # ----------------------------------------------------------
+  # pH calculation
+  #
+  # Two-point calibration at approximately 22.5 C:
+  #
+  #   pH 7.00 = 1.541636 V
+  #   pH 4.00 = 2.053444 V
+  #
+  # Linear interpolation between calibration points.
+  # ----------------------------------------------------------
+
+  - platform: template
+    name: "pH"
+    id: ph
+
+    accuracy_decimals: 2
+    update_interval: never
+
+    lambda: |-
+      float voltage = id(ph_voltage).state;
+
+      if (isnan(voltage)) {
+        return NAN;
+      }
+
+      const float v7 = 1.541636;
+      const float v4 = 2.053444;
+
+      return 7.0 - 3.0 * (voltage - v7) / (v4 - v7);
+
+
+# ============================================================
+# Sensor power switches
+# ============================================================
+
+switch:
+
+  - platform: gpio
+    pin: GPIO25
+    name: "TDS Power"
+    id: tds_power
+    restore_mode: ALWAYS_OFF
+
+
+  - platform: gpio
+    pin: GPIO26
+    name: "pH Power"
+    id: ph_power
+    restore_mode: ALWAYS_OFF
+
+
+# ============================================================
+# Measurement script
+#
+# Runs every two hours.
+#
+# TDS:
+#   Power on
+#   Wait 60 seconds
+#   Collect 9 ADC readings over 40 seconds
+#   Power off
+#   Calculate TDS
+#
+# Wait 10 seconds
+#
+# pH:
+#   Power on
+#   Wait 60 seconds
+#   Collect 9 ADC readings over 40 seconds
+#   Power off
+#   Calculate pH
+#
+# Total duration: approximately 3.5 minutes
+# ============================================================
+
+script:
+
+  # Single place where readings are published to MQTT.
+  # ts: measurement time (Unix seconds).
+  - id: publish_reading
+    mode: queued
+    parameters:
+      name: string
+      value: float
+      ts: uint32_t
+    then:
+      - if:
+          condition:
+            lambda: 'return id(sntp_time).now().is_valid() && !isnan(value);'
+          then:
+            - mqtt.publish_json:
+                topic: !lambda 'return "fishtank/reading/" + name;'
+                qos: 1
+                payload: |-
+                  root["ts"] = ts;
+                  root["value"] = value;
+
+  - id: measure_water_quality
+    mode: single
+
+    then:
+
+      # --------------------------------------------------------
+      # Check prerequisites again
+      # --------------------------------------------------------
+
+      - if:
+          condition:
+            lambda: |-
+              return id(ntp_synchronized)
+                  && id(sntp_time).now().is_valid()
+                  && id(temperature_ready)
+                  && !isnan(id(water_temperature).state);
+
+          then:
+
+            # ==================================================
+            # TDS
+            # ==================================================
+
+            - logger.log: "Starting water quality measurement"
+
+            # Temperature compensation uses the latest 15-minute reading
+
+            # Ensure both analog sensors are off
+            - switch.turn_off: tds_power
+            - switch.turn_off: ph_power
+
+            - delay: 2s
+
+            - logger.log: "Starting TDS measurement"
+
+            - switch.turn_on: tds_power
+
+            # Settling time
+            - delay: 60s
+
+            # Nine ADC measurements
+            # Median filter publishes after measurement 9
+
+            - repeat:
+                count: 9
+                then:
+                  - component.update: tds_voltage
+                  - delay: 5s
+
+            # Measurement time: the last ADC sample was just taken
+            - lambda: 'id(reading_ts) = id(sntp_time).now().timestamp;'
+
+            # Power down
+            - switch.turn_off: tds_power
+
+            # Calculate using filtered voltage
+            - component.update: tds
+
+            - logger.log:
+                format: "TDS median voltage: %.3f V; TDS: %.0f ppm"
+                args:
+                  - 'id(tds_voltage).state'
+                  - 'id(tds).state'
+
+            # Publish voltage and value with the measurement time
+            - script.execute:
+                id: publish_reading
+                name: tds_voltage
+                value: !lambda 'return id(tds_voltage).state;'
+                ts: !lambda 'return id(reading_ts);'
+            - script.execute:
+                id: publish_reading
+                name: tds
+                value: !lambda 'return id(tds).state;'
+                ts: !lambda 'return id(reading_ts);'
+
+            # Allow TDS circuitry to discharge
+            - delay: 10s
+
+
+            # ==================================================
+            # pH
+            # ==================================================
+
+            - logger.log: "Starting pH measurement"
+
+            - switch.turn_on: ph_power
+
+            # Settling time
+            - delay: 60s
+
+            # Nine ADC measurements
+            # Median filter publishes after measurement 9
+
+            - repeat:
+                count: 9
+                then:
+                  - component.update: ph_voltage
+                  - delay: 5s
+
+            # Measurement time: the last ADC sample was just taken
+            - lambda: 'id(reading_ts) = id(sntp_time).now().timestamp;'
+
+            # Power down
+            - switch.turn_off: ph_power
+
+            # Calculate using filtered voltage
+            - component.update: ph
+
+            - logger.log:
+                format: "pH median voltage: %.3f V; pH: %.2f"
+                args:
+                  - 'id(ph_voltage).state'
+                  - 'id(ph).state'
+
+            # Publish voltage and value with the measurement time
+            - script.execute:
+                id: publish_reading
+                name: ph_voltage
+                value: !lambda 'return id(ph_voltage).state;'
+                ts: !lambda 'return id(reading_ts);'
+            - script.execute:
+                id: publish_reading
+                name: ph
+                value: !lambda 'return id(ph).state;'
+                ts: !lambda 'return id(reading_ts);'
+
+            - logger.log: "Water quality measurement complete"
+
+          else:
+            - logger.log:
+                level: WARN
+                format: "Measurement aborted: prerequisites not satisfied"
