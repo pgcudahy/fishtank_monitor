@@ -145,6 +145,24 @@ mqtt:
   broker: 192.168.18.18
   username: fishtank
   password: !secret fishtank__mqtt_password
+  # Publish any payload to fishtank/command/measure to run a measurement now
+  on_message:
+    - topic: fishtank/command/measure
+      then:
+        - if:
+            condition:
+              lambda: |-
+                return id(ntp_synchronized)
+                    && id(sntp_time).now().is_valid()
+                    && id(temperature_ready)
+                    && !isnan(id(water_temperature).state);
+            then:
+              - logger.log: "Measurement requested via MQTT"
+              - script.execute: measure_water_quality
+            else:
+              - logger.log:
+                  level: WARN
+                  format: "Ignoring MQTT measure request: NTP or temperature not ready"
 
 
 # ============================================================

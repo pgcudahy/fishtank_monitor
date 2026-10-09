@@ -14,6 +14,18 @@ use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS};
 use serde::Deserialize;
 use tokio_postgres::Client;
 
+// Shadow the std macros so every log line starts with a UTC timestamp
+macro_rules! println {
+    ($($arg:tt)*) => {
+        std::println!("{} {}", chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"), format_args!($($arg)*))
+    };
+}
+macro_rules! eprintln {
+    ($($arg:tt)*) => {
+        std::eprintln!("{} {}", chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"), format_args!($($arg)*))
+    };
+}
+
 struct Row {
     ts: i64, // Unix seconds
     sensor: String,
@@ -186,10 +198,13 @@ async fn main() {
     let m = cfg.mqtt;
     let mut opts = MqttOptions::new(m.client_id, m.host, m.port.get());
     opts.set_keep_alive(Duration::from_secs(30));
-    opts.set_clean_session(false);
     if let (Some(user), Some(password)) = (m.user, m.password) {
         opts.set_credentials(user, password);
     }
+    // The broker keeps subscriptions of a persistent session, so one left over from an
+    // older topic filter would keep delivering unwanted topics. Drop the stored session once.
+    reset_session(&opts).await;
+    opts.set_clean_session(false);
     let topic = m.topic;
     let (client, mut eventloop) = AsyncClient::new(opts, 64);
 
@@ -253,6 +268,35 @@ async fn main() {
                 }
             }
         }
+    }
+}
+
+// Connect once with a clean session so the broker discards stale subscriptions and queued messages
+async fn reset_session(opts: &MqttOptions) {
+    let mut opts = opts.clone();
+    opts.set_clean_session(true);
+    let (client, mut eventloop) = AsyncClient::new(opts, 10);
+    let run = async {
+        loop {
+            match eventloop.poll().await {
+                Ok(Event::Incoming(Packet::ConnAck(_))) => break Ok(()),
+                Ok(_) => {}
+                Err(e) => break Err(e),
+            }
+        }
+    };
+    match tokio::time::timeout(Duration::from_secs(10), run).await {
+        Ok(Ok(())) => {
+            let _ = client.disconnect().await;
+            // Let the DISCONNECT packet go out
+            let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                while eventloop.poll().await.is_ok() {}
+            })
+            .await;
+            println!("mqtt session reset");
+        }
+        Ok(Err(e)) => eprintln!("mqtt session reset failed: {e}"),
+        Err(_) => eprintln!("mqtt session reset timed out"),
     }
 }
 

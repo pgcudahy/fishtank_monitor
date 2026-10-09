@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 axum = "0.8.9"
 bytes = "1.12.1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 futures-util = "0.3.34"
 native-tls = "0.2.18"
 polars = { version = "0.55.2", default-features = false, features = ["csv", "dtype-datetime", "temporal", "fmt", "lazy"] }

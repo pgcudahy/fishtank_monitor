@@ -2,3 +2,4 @@ target
 config.toml
 esphome/secrets.yaml
 esphome/.esphome/
+data_analysis/
