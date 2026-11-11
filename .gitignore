@@ -4,3 +4,5 @@ esphome/secrets.yaml
 esphome/.esphome/
 
 .DS_store
+
+data_analysis/.ipynb_checkpoints
